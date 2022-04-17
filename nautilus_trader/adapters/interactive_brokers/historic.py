@@ -38,11 +38,17 @@ from nautilus_trader.persistence.external.core import write_objects
 
 logger = logging.getLogger(__name__)
 
+TICK_TYPES = Literal["BID_ASK", "TRADES"]
+BAR_TYPES = Literal["TRADES", "MIDPOINT", "BID", "ASK", "BID_ASK"]
 
-def make_filename(
+BACK_FILL_KINDS = ("TICK_BID_ASK", "TICK_TRADES", "BAR_BID_ASK", "BAR_TRADES")
+BACK_FILL_KINDS_TYPE = Literal["TICK_BID_ASK", "TICK_TRADES", "BAR_BID_ASK", "BAR_TRADES"]
+
+
+def make_tick_filename(
     catalog: DataCatalog,
     instrument_id: InstrumentId,
-    kind: Literal["BID_ASK", "TRADES"],
+    kind: BACK_FILL_KINDS_TYPE,
     date: datetime.date,
 ):
     fn_kind = {"BID_ASK": "quote_tick", "TRADES": "trade_tick"}[kind]
@@ -56,7 +62,7 @@ def back_fill_catalog(
     start_date: datetime.date,
     end_date: datetime.date,
     tz_name: str,
-    kinds=("BID_ASK", "TRADES"),
+    kind: BACK_FILL_KINDS_TYPE = "TICK_BID_ASK",
 ):
     """
     Back fill the data catalog with market data from Interactive Brokers.
@@ -75,40 +81,36 @@ def back_fill_catalog(
         The end_date for the back fill.
     tz_name : str
         The timezone of the contracts
-    kinds : tuple[str] (default: ('BID_ASK', 'TRADES')
-        The kinds to query data for
+    kind : str
+        The `BACK_FILL_KINDS` to query data for
     """
+    assert kind in BACK_FILL_KINDS
     for contract in contracts:
         [details] = ib.reqContractDetails(contract=contract)
         instrument = parse_instrument(contract_details=details)
         for date in pd.bdate_range(start_date, end_date, tz=tz_name):
-            for kind in kinds:
-                fn = make_filename(catalog, instrument_id=instrument.id, kind=kind, date=date)
-                if catalog.fs.exists(fn):
-                    logger.info(
-                        f"file for {instrument.id.value} {kind} {date:%Y-%m-%d} exists, skipping"
-                    )
-                    continue
-                logger.info(f"Fetching {instrument.id.value} {kind} for {date:%Y-%m-%d}")
-                raw = fetch_market_data(
-                    contract=contract, date=date.to_pydatetime(), kind=kind, tz_name=tz_name, ib=ib
+            fn = make_filename(catalog, instrument_id=instrument.id, kind=kind, date=date)
+            if catalog.fs.exists(fn):
+                logger.info(
+                    f"file for {instrument.id.value} {kind} {date:%Y-%m-%d} exists, skipping"
                 )
-                if not raw:
-                    logging.info("No ticks for {, skipping")
-                    continue
-                logger.info(f"Fetched {len(raw)} raw ticks")
-                if kind == "TRADES":
-                    ticks = parse_historic_trade_ticks(
-                        historic_ticks=raw, instrument_id=instrument.id
-                    )
-                elif kind == "BID_ASK":
-                    ticks = parse_historic_quote_ticks(
-                        historic_ticks=raw, instrument_id=instrument.id
-                    )
-                else:
-                    raise RuntimeError()
-                template = f"{date:%Y%m%d}" + "-{i}.parquet"
-                write_objects(catalog=catalog, chunk=ticks, basename_template=template)
+                continue
+            logger.info(f"Fetching {instrument.id.value} {kind} for {date:%Y-%m-%d}")
+            raw = fetch_market_data(
+                contract=contract, date=date.to_pydatetime(), kind=kind, tz_name=tz_name, ib=ib
+            )
+            if not raw:
+                logging.info("No ticks for {, skipping")
+                continue
+            logger.info(f"Fetched {len(raw)} raw ticks")
+            if kind == "TRADES":
+                ticks = parse_historic_trade_ticks(historic_ticks=raw, instrument_id=instrument.id)
+            elif kind == "BID_ASK":
+                ticks = parse_historic_quote_ticks(historic_ticks=raw, instrument_id=instrument.id)
+            else:
+                raise RuntimeError()
+            template = f"{date:%Y%m%d}" + "-{i}.parquet"
+            write_objects(catalog=catalog, chunk=ticks, basename_template=template)
 
 
 def fetch_market_data(
@@ -162,6 +164,17 @@ def _request_historical_ticks(ib: IB, contract: Contract, start_time: str, what=
     )
 
 
+def _request_historical_bars(ib: IB, contract: Contract, start_time: str, what="BID_ASK"):
+    return ib.reqHistoricalData(
+        contract=contract,
+        startDateTime=start_time,
+        endDateTime="",
+        numberOfTicks=1000,
+        whatToShow=what,
+        useRth=False,
+    )
+
+
 def _determine_next_timestamp(timestamps: List[pd.Timestamp], date: datetime.date, tz_name: str):
     """
     While looping over available data, it is possible for very liquid products that a 1s period may contain 1000 ticks,
@@ -198,6 +211,31 @@ def parse_historic_quote_ticks(
 
 
 def parse_historic_trade_ticks(
+    historic_ticks: List[HistoricalTickLast], instrument_id: InstrumentId
+) -> List[TradeTick]:
+    trades = []
+    for tick in historic_ticks:
+        ts_init = dt_to_unix_nanos(tick.time)
+        trade_tick = TradeTick(
+            instrument_id=instrument_id,
+            price=Price.from_str(str(tick.price)),
+            size=Quantity.from_str(str(tick.size)),
+            aggressor_side=AggressorSide.UNKNOWN,
+            trade_id=generate_trade_id(
+                symbol=instrument_id.symbol.value,
+                ts_event=ts_init,
+                price=tick.price,
+                size=tick.size,
+            ),
+            ts_init=ts_init,
+            ts_event=ts_init,
+        )
+        trades.append(trade_tick)
+
+    return trades
+
+
+def parse_historic_bars(
     historic_ticks: List[HistoricalTickLast], instrument_id: InstrumentId
 ) -> List[TradeTick]:
     trades = []
